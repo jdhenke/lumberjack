@@ -32,6 +32,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -111,8 +112,8 @@ type Logger struct {
 	file *os.File
 	mu   sync.Mutex
 
-	millCh    chan bool
-	startMill sync.Once
+	dirty   int32
+	running int32
 }
 
 var (
@@ -374,25 +375,37 @@ func (l *Logger) millRunOnce() error {
 }
 
 // millRun runs in a goroutine to manage post-rotation compression and removal
-// of old log files.
+// of old log files until there are no more files to rotate.
 func (l *Logger) millRun() {
-	for _ = range l.millCh {
+	// always execute the first pass because mill() guards calling millRun()
+	// with mustMill() already.
+	for mustMill := true; mustMill; mustMill = l.mustMill() {
+		// mark dirty as 0 to allow concurrent calls to mill to mark it as 1
+		// to signal this to goroutine should continue
+		atomic.StoreInt32(&l.dirty, 0)
+
 		// what am I going to do, log this?
 		_ = l.millRunOnce()
+
+		// set running to 0 to allow mustMill() to compare and swap back to 1,
+		// either in this goroutine or in mill(), but not both.
+		atomic.StoreInt32(&l.running, 0)
 	}
+
 }
 
 // mill performs post-rotation compression and removal of stale log files,
-// starting the mill goroutine if necessary.
+// starting a mill goroutine if necessary.
 func (l *Logger) mill() {
-	l.startMill.Do(func() {
-		l.millCh = make(chan bool, 1)
+	atomic.StoreInt32(&l.dirty, 1)
+	if l.mustMill() {
 		go l.millRun()
-	})
-	select {
-	case l.millCh <- true:
-	default:
 	}
+}
+
+// mustMill returns true if the caller must start or continue millRun.
+func (l *Logger) mustMill() bool {
+	return atomic.LoadInt32(&l.dirty) == 1 && atomic.CompareAndSwapInt32(&l.running, 0, 1)
 }
 
 // oldLogFiles returns the list of backup log files stored in the same
